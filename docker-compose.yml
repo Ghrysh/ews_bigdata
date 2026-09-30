@@ -1,0 +1,115 @@
+version: '3.8'
+
+services:
+  postgres_db:
+    image: postgres:15
+    container_name: ews_postgres
+    restart: always
+    ports:
+      - "5450:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: ews_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ews_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    networks:
+      - ews_network
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    container_name: ews_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - ews_network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    container_name: ews_kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:9092", "--list"]
+      interval: 30s
+      timeout: 20s
+      retries: 20
+      start_period: 40s
+    networks:
+      - ews_network
+
+  ews_processor:
+    build: .
+    container_name: ews_processor
+    # Processor HANYA akan nyala jika Kafka & DB sudah lulus Healthcheck
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres_db:
+        condition: service_healthy
+    extra_hosts:
+      - "kafka:host-gateway"
+    command: >
+      spark-submit 
+      --jars /app/jars/postgresql-42.5.0.jar,/app/jars/spark-sql-kafka-0-10_2.12-3.5.0.jar,/app/jars/spark-token-provider-kafka-0-10_2.12-3.5.0.jar,/app/jars/kafka-clients-3.4.1.jar,/app/jars/commons-pool2-2.11.1.jar,/app/jars/hadoop-aws-3.3.4.jar,/app/jars/aws-java-sdk-bundle-1.12.262.jar
+      spark_processor.py
+    environment:
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - DB_URL=postgresql://postgres:password123@postgres_db:5432/ews_db
+    networks:
+      - ews_network
+
+  ews_scraper:
+    build: .
+    container_name: ews_scraper
+    restart: on-failure:5
+    depends_on:
+      kafka:
+        condition: service_healthy
+    extra_hosts:
+      - "kafka:host-gateway"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - KAFKA_BROKER=kafka:9092
+    command: python3 scraper.py
+    networks:
+      - ews_network
+
+  ews_app:
+    build: .
+    container_name: ews_streamlit_app
+    restart: always
+    depends_on:
+      postgres_db:
+        condition: service_healthy
+    ports:
+      - "8501:8501"
+    environment:
+      - DB_URL=postgresql://postgres:password123@postgres_db:5432/ews_db
+    command: >
+      python3 -m streamlit run app_ews.py --server.port=8501 --server.address=0.0.0.0 --server.enableCORS=false --server.baseUrlPath=ews
+    networks:
+      - ews_network
+
+networks:
+  ews_network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  hf_cache:
+  minio_data:
